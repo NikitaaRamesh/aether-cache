@@ -1,0 +1,11 @@
+[package]
+name = "aether-cache"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = "1.12.1"
+crossbeam-queue = "0.3.14"
+hashbrown = "0.17.1"
+parking_lot = "0.12.5"
+tokio = { version = "1.53.1", features = ["full"] }
