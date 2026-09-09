@@ -30,22 +30,39 @@ impl<K, V> CacheShard<K, V> {
 ///
 /// Unlike a Python dictionary protected by one lock, unrelated keys can be read
 /// or written concurrently when they route to different shards.
-pub struct ShardedCache<K, V> {
+pub struct ShardedCache<K, V, S = RandomState> {
     shards: Box<[CacheShard<K, V>]>,
-    hash_builder: RandomState,
+    hash_builder: S,
 }
 
-impl<K, V> ShardedCache<K, V> {
+impl<K, V> ShardedCache<K, V, RandomState> {
     /// Creates an empty cache containing [`SHARD_COUNT`] shards.
     pub fn new() -> Self {
-        debug_assert!(SHARD_COUNT.is_power_of_two());
+        Self::with_hasher(SHARD_COUNT, RandomState::new())
+    }
+}
 
-        let mut shards = Vec::with_capacity(SHARD_COUNT);
-        shards.resize_with(SHARD_COUNT, CacheShard::new);
+impl<K, V, S> ShardedCache<K, V, S>
+where
+    S: BuildHasher,
+{
+    /// Creates an empty cache with a power-of-two shard count and hash builder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shard_count` is zero or is not a power of two.
+    pub fn with_hasher(shard_count: usize, hash_builder: S) -> Self {
+        assert!(
+            shard_count.is_power_of_two(),
+            "shard count must be a non-zero power of two"
+        );
+
+        let mut shards = Vec::with_capacity(shard_count);
+        shards.resize_with(shard_count, CacheShard::new);
 
         Self {
             shards: shards.into_boxed_slice(),
-            hash_builder: RandomState::new(),
+            hash_builder,
         }
     }
 
@@ -55,7 +72,7 @@ impl<K, V> ShardedCache<K, V> {
         Q: Hash + ?Sized,
     {
         let hash = self.hash_builder.hash_one(key);
-        let index = (hash as usize) & (SHARD_COUNT - 1);
+        let index = (hash as usize) & (self.shards.len() - 1);
 
         &self.shards[index]
     }

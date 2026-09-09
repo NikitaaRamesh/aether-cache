@@ -1,4 +1,4 @@
-use std::{io, sync::Arc};
+use std::{hash::BuildHasher, io, sync::Arc};
 
 use bytes::BytesMut;
 use tokio::{
@@ -11,18 +11,19 @@ use crate::shard::ShardedCache;
 const INITIAL_READ_CAPACITY: usize = 8 * 1024;
 
 /// An asynchronous TCP front end for a shared sharded cache.
-pub struct CacheServer<K, V> {
-    cache: Arc<ShardedCache<K, V>>,
+pub struct CacheServer<K, V, S> {
+    cache: Arc<ShardedCache<K, V, S>>,
     port: u16,
 }
 
-impl<K, V> CacheServer<K, V>
+impl<K, V, S> CacheServer<K, V, S>
 where
     K: Send + Sync + 'static,
     V: Send + Sync + 'static,
+    S: BuildHasher + Send + Sync + 'static,
 {
     /// Creates a server that owns a shared cache handle and listens on `port`.
-    pub fn new(cache: Arc<ShardedCache<K, V>>, port: u16) -> Self {
+    pub fn new(cache: Arc<ShardedCache<K, V, S>>, port: u16) -> Self {
         Self { cache, port }
     }
 
