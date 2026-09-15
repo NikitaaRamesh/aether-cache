@@ -9,11 +9,13 @@ use bytes::Bytes;
 use hashbrown::DefaultHashBuilder;
 
 const SERVER_PORT: u16 = 6379;
+const TOTAL_CAPACITY: usize = 1_000_000;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let cache = Arc::new(ShardedCache::<Bytes, CacheEntry, DefaultHashBuilder>::new(
         SHARD_COUNT,
+        TOTAL_CAPACITY,
         DefaultHashBuilder::default(),
     ));
     let server = CacheServer::new(cache, SERVER_PORT);

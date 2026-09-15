@@ -6,7 +6,10 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-use crate::{entry::CacheEntry, frame::Frame, parse::parse_frame, shard::ShardedCache};
+use crate::{
+    entry::CacheEntry, eviction::EvictionPolicy, frame::Frame, parse::parse_frame,
+    shard::ShardedCache,
+};
 
 const INITIAL_READ_CAPACITY: usize = 8 * 1024;
 
@@ -96,7 +99,9 @@ where
 
         {
             let shard = cache.get_shard(&key);
-            shard.map.write().insert(key, entry);
+            let mut map = shard.map.write();
+            map.insert(key, entry);
+            shard.policy.evict(&mut map);
         }
 
         stream.write_all(b"+OK\r\n").await
@@ -159,6 +164,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let cache = Arc::new(ShardedCache::<Bytes, CacheEntry, DefaultHashBuilder>::new(
             64,
+            1_000,
             DefaultHashBuilder::default(),
         ));
         let server_cache = Arc::clone(&cache);
