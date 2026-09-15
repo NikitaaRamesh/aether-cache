@@ -1,128 +1,317 @@
 # Aether Cache
+![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
-Aether Cache is a Rust-based concurrent, in-memory cache core designed for analytical workloads with high read parallelism, predictable lock contention, and low-copy binary payload handling. Its current foundation consists of a 64-way sharded hash table and a compact cache-entry representation with optional TTL metadata and atomic access accounting.
+> High-throughput, highly concurrent, zero-copy in-memory analytical caching in Rust.
 
-> **Project status:** early-stage infrastructure. Sharding, entry representation, and concurrency stress tests are implemented. Public cache operations, expiration enforcement, eviction policy, capacity accounting, and persistence are not yet part of the API.
+Aether Cache is a strictly typed RESP (Redis Serialization Protocol) TCP server engineered around multicore scalability, bounded cache capacity, and predictable memory behavior. The implementation combines asynchronous Tokio networking, transactional stream parsing, cache-line-aligned sharding, zero-copy binary payloads, and compile-time-pluggable eviction policies.
 
-## Architecture Overview
+The server currently implements the RESP subset required for binary-safe `SET key value` and `GET key` operations. Its architecture deliberately avoids a cache-wide mutex: synchronization is partitioned across 64 independent shards, read metadata is buffered through lock-free queues, and payload ownership is transferred through `bytes::Bytes` rather than copied.
 
-Aether Cache partitions its key space across exactly 64 independent shards. Each shard owns a `hashbrown::HashMap<K, V>` guarded by its own `parking_lot::RwLock`; there is no cache-wide lock on the data path.
+> **Status:** systems-engineering project and protocol/cache core. Persistence, replication, Redis command parity, authentication, and distributed operation are outside the current scope.
+
+## Table of Contents
+
+- [🏗️ Architecture & Systems Engineering](#️-architecture--systems-engineering)
+  - [🌐 Zero-Copy Networking](#-zero-copy-networking)
+  - [🧱 Cache-Line-Aligned Sharding](#-cache-line-aligned-sharding)
+  - [🔌 Pluggable Eviction Architecture](#-pluggable-eviction-architecture)
+  - [⚡ Amortized Lock-Free Reads with Strict LRU](#-amortized-lock-free-reads-with-strict-lru)
+  - [📉 O(1) Sampled LFU](#-o1-sampled-lfu)
+  - [🧠 Entry Layout and Memory Semantics](#-entry-layout-and-memory-semantics)
+- [📊 Performance & Stability Benchmarks](#-performance--stability-benchmarks)
+  - [Local TCP throughput](#local-tcp-throughput)
+  - [High-cardinality memory stability](#high-cardinality-memory-stability)
+  - [Correctness and concurrency coverage](#correctness-and-concurrency-coverage)
+- [🚀 Quick Start / Usage](#-quick-start--usage)
+  - [Prerequisites](#prerequisites)
+  - [Build and run](#build-and-run)
+  - [Use `redis-cli`](#use-redis-cli)
+  - [Use `redis-py`](#use-redis-py)
+  - [Stress client](#stress-client)
+  - [Development validation](#development-validation)
+- [📁 Source Layout](#-source-layout)
+- [⚙️ Current Runtime Configuration](#️-current-runtime-configuration)
+
+## 🏗️ Architecture & Systems Engineering
 
 ```mermaid
-graph LR
-    K[Key] --> H[RandomState hash]
-    H --> M[hash & 63]
-    M --> S0[Shard 0]
-    M --> S1[Shard 1]
-    M --> SN[Shard 63]
-    S0 --> L0[RwLock]
-    S1 --> L1[RwLock]
-    SN --> LN[RwLock]
-    L0 --> H0[hashbrown HashMap]
-    L1 --> H1[hashbrown HashMap]
-    LN --> HN[hashbrown HashMap]
+flowchart LR
+    TCP[TCP stream] --> BM[BytesMut receive buffer]
+    BM --> VP[Validation pass]
+    VP --> CP[Zero-copy consuming pass]
+    CP --> RESP[Typed RESP Frame]
+    RESP --> ROUTE[Hash and bitmask routing]
+    ROUTE --> S0[Shard 0]
+    ROUTE --> SN[Shard 63]
+    S0 --> MAP0[RwLock + hashbrown HashMap]
+    SN --> MAPN[RwLock + hashbrown HashMap]
+    MAP0 --> POLICY0[Eviction policy]
+    MAPN --> POLICYN[Eviction policy]
 ```
 
-For a key $k$, routing is computed as:
+### 🌐 Zero-Copy Networking
 
-$$
-\operatorname{shard}(k) = \operatorname{hash}(k) \mathbin{\&} (64 - 1)
-$$
+Each accepted TCP connection runs in its own Tokio task. Incoming data is read directly into a reusable `bytes::BytesMut` allocation with `AsyncReadExt::read_buf`; the server does not introduce a temporary read buffer between the socket and parser.
 
-Because 64 is a power of two, the bit mask replaces a modulo operation while preserving an index in the range $[0, 63]$. A per-cache `RandomState` supplies randomized hashing, and equal keys route consistently for the lifetime of one cache instance.
+RESP parsing is deliberately split into two phases:
 
-The shard collection is allocated once as a contiguous boxed slice. This keeps the owning `ShardedCache<K, V>` small while maintaining a fixed shard count and stable shard addresses. `hashbrown::HashMap` provides a high-performance SwissTable-style implementation with cache-efficient metadata probing.
+1. **Validation pass:** recursively scans frame boundaries and verifies lengths, nesting, and CRLF terminators without mutating the receive buffer.
+2. **Consumption pass:** runs only after the entire frame is available. Bulk payloads are detached with `BytesMut::split_to()` and converted with `.freeze()`.
 
-The entry representation uses `#[repr(C)]` and contains:
+This transaction-like design gives streaming correctness: a partial TCP frame returns `Ok(None)` and leaves every byte untouched for the next read. Once complete, the bulk payload becomes an immutable `Bytes` handle that shares the receive allocation. The payload is then moved through `Frame::BulkString`, into `CacheEntry`, and back to socket writes without duplicating its byte region.
 
-- Immutable `bytes::Bytes` handles for the key and value.
-- An optional absolute expiration timestamp in Unix epoch milliseconds.
-- An `AtomicU32` access counter initialized to zero.
+`Bytes::clone()` is used only where independently owned handles are required. It performs an atomic reference-count increment rather than a payload allocation or byte-for-byte copy.
 
-TTL construction uses saturating timestamp arithmetic. If the system clock is before the Unix epoch, the constructor fails open by creating a non-expiring entry instead of risking immediate accidental eviction.
+Additional parser safeguards include:
 
-## Concurrency Model
+- Checked length arithmetic and strict CRLF validation.
+- Transactional handling of incomplete nested arrays.
+- A 128-level nesting limit against adversarial recursion.
+- Binary-safe bulk strings; command names alone use ASCII case-insensitive matching.
 
-Each `CacheShard<K, V>` owns an independent `parking_lot::RwLock<HashMap<K, V>>`. Operations contend only when their keys map to the same shard:
+### 🧱 Cache-Line-Aligned Sharding
 
-- Multiple readers may access one shard concurrently.
-- A writer receives exclusive access to one shard.
-- Readers and writers on unrelated shards proceed independently.
-- No global mutex serializes the full cache.
+The key space is partitioned across **64 shards**. Each `CacheShard<K, V, P>` owns:
 
-`parking_lot::RwLock` is used instead of `std::sync::RwLock` for its compact representation, efficient parking behavior under contention, and non-poisoning semantics. A panic while holding a write guard does not permanently poison the shard; callers remain responsible for maintaining logical invariants around multi-step mutations.
+- A `parking_lot::RwLock<hashbrown::HashMap<K, V>>`.
+- An independent eviction-policy instance `P`.
+- A bounded, lock-free read-event buffer.
 
-`CacheShard` is declared with `#[repr(align(64))]`. Rust therefore gives every shard at least 64-byte alignment and rounds its object size to an alignment-compatible multiple. Adjacent shard locks cannot occupy the same conventional 64-byte hardware cache line, reducing false sharing caused by lock-state updates from different CPU cores.
+Shard routing is a constant-time power-of-two mask:
 
-The lock guards are synchronous. They should be held only for the shortest map operation and must not be retained across `.await` points. As in Python, a write operation still requires exclusion; unlike a Python dictionary commonly protected by one process-wide lock, this design permits genuine parallel access across independent shards.
+```text
+shard_index = hash(key) & (shard_count - 1)
+```
 
-The test suite includes a stress test that launches 16 native threads. Each thread inserts 10,000 unique `String` key-value pairs, after which the aggregate size of all shards must be exactly 160,000 entries.
+With 64 shards, this resolves to `hash & 63`, avoiding integer division on the routing path. The shard count is validated as a non-zero power of two during construction.
 
-## Memory Management
+`CacheShard` uses `#[repr(align(64))]`, guaranteeing at least conventional hardware cache-line alignment. Adjacent lock words therefore do not share a 64-byte cache line, preventing unrelated cores from repeatedly invalidating one another's lock state through false sharing. A contained type may impose stricter alignment on a particular platform; the tested invariant is alignment of **at least** 64 bytes.
 
-Payloads use `bytes::Bytes`, an immutable, reference-counted byte buffer designed for inexpensive sharing across threads:
+There is no global map lock. Keys routed to different shards can be read or mutated independently, while `parking_lot::RwLock` permits concurrent readers within a shard. Every synchronous lock guard is scoped and dropped before network `.await` points, preventing Tokio tasks from suspending while retaining shard ownership.
 
-- Moving a `Bytes` value into a cache entry transfers only its handle.
-- Cloning a `Bytes` handle increments the shared allocation's reference count; it does not copy payload bytes.
-- Slices can share the original backing allocation without allocating or copying the selected payload region.
-- The backing allocation is released when the final handle is dropped.
+### 🔌 Pluggable Eviction Architecture
 
-This differs from copying a Python `bytes` slice, which ordinarily creates a new byte object and duplicates the selected data. The Rust ownership model makes sharing explicit: borrowed access can avoid even a handle clone, while a cloned `Bytes` handle provides independently owned access to the same immutable storage.
+Eviction is modeled as a Strategy Pattern through the `EvictionPolicy` trait:
 
-The sharded map introduces one initial allocation for the boxed shard collection. Individual `HashMap` tables allocate independently as entries are inserted, so growth and rehashing in one shard do not relocate or block other shards. Cache-line alignment intentionally trades a small amount of padding for lower coherence traffic under multicore contention.
+```rust
+pub trait EvictionPolicy {
+    fn on_read(&self, key: Bytes);
+    fn promote(&self, key: Bytes);
+    fn evict(&self, map: &mut RwLockWriteGuard<'_, HashMap<Bytes, CacheEntry>>);
+}
+```
 
-The access counter is an atomic field rather than a lock-protected integer. Atomics permit concurrent metadata updates without acquiring the shard write lock; the exact ordering and saturation policy will be defined alongside the eviction implementation.
+The cache is generic over the full policy type:
 
-## Setup Instructions
+```rust
+ShardedCache<K, V, P, S>
+```
+
+`P` is instantiated independently for every shard through a policy factory. Rust monomorphizes each concrete cache configuration, providing static dispatch with no virtual calls, trait-object allocation, or runtime policy tag on the command path. The hasher `S` is likewise generic; the executable uses `hashbrown::DefaultHashBuilder`.
+
+The current executable selects `StrictLru`, while `SampledLfu` remains available as a secondary policy implementation.
+
+### ⚡ Amortized Lock-Free Reads with Strict LRU
+
+Exact access-order maintenance normally turns every GET into a write operation. Aether Cache avoids that bottleneck by separating read observation from policy maintenance.
+
+Each shard contains a capacity-128 `crossbeam_queue::ArrayQueue<Bytes>`. After the shard read guard is released, GET performs a non-blocking queue push containing only a cheap `Bytes` key handle. As long as capacity remains, readers do not acquire the shard write lock or the LRU ordering lock.
+
+When the queue is full, one reader becomes the maintenance participant:
+
+1. It acquires the shard write lock.
+2. It promotes the rejected event and drains the 128 queued events.
+3. It applies the entire access-order batch to `StrictLru`.
+4. It executes capacity eviction before releasing the guard.
+
+This converts up to 129 individual metadata updates into one write-lock acquisition. Under read-heavy multicore workloads, concurrent tasks remain on the lock-free enqueue path while maintenance cost is amortized across a batch.
+
+`StrictLru` stores chronological keys in a `VecDeque<Bytes>`. Promotion appends to the back; eviction pops from the front and skips stale records whose keys have already disappeared from the map. Interior policy mutation uses `parking_lot::Mutex`, not `std::sync::Mutex` and not a cache-wide lock.
+
+### 📉 O(1) Sampled LFU
+
+`SampledLfu` provides a maintenance-free alternative inspired by Redis `maxmemory-policy allkeys-lfu`. Every `CacheEntry` carries a saturating `AtomicU32` access counter updated with `Ordering::Relaxed`; frequency accounting does not publish payload memory and therefore requires no stronger ordering.
+
+When a shard exceeds capacity, the policy evaluates:
+
+```rust
+map.iter()
+    .take(5)
+    .min_by_key(|(_, entry)| entry.access_count())
+```
+
+`hashbrown`'s randomized table layout makes the first five iteration candidates an inexpensive bounded sample. Because sample size is constant, victim selection is O(1) with respect to cache size and requires no heap, global frequency list, timer, or background maintenance thread. The selected key is removed and sampling repeats only until the shard returns to its target capacity.
+
+### 🧠 Entry Layout and Memory Semantics
+
+`CacheEntry` uses `#[repr(C)]` and stores:
+
+- `Bytes` key and value handles.
+- Optional absolute expiration in Unix epoch milliseconds.
+- A saturating `AtomicU32` access counter.
+
+TTL arithmetic is saturating, and expiration reads do not require exclusive shard access. Payload retrieval clones only the immutable `Bytes` handle before dropping the shard read guard, allowing socket I/O to proceed safely without pinning the map lock.
+
+Total capacity is divided across shards at construction. This gives each partition an independent target and keeps eviction local to the contended shard. The design targets a stable memory envelope under high-cardinality workloads; process memory also includes allocator slack, hash-table capacity, socket buffers, parser buffers, and queued metadata.
+
+## 📊 Performance & Stability Benchmarks
+
+### Local TCP throughput
+
+A single-threaded Python client issuing pipelined RESP commands over loopback has measured approximately:
+
+> **~40,000 operations/second**
+
+This result measures the complete path: Python serialization, local TCP, Tokio scheduling, two-phase RESP parsing, shard routing, map mutation, eviction checks, and response draining. It is an observed development-system result, not a hardware-independent guarantee. Compiler version, CPU topology, Windows networking, command mix, key/value size, pipeline depth, and active eviction policy materially affect throughput.
+
+### High-cardinality memory stability
+
+A sustained stress run blasted **20,000,000 unique keys** through the bounded cache. During the verified run, resident memory reached a plateau rather than growing linearly with key cardinality; eviction continued under pressure and the operating-system OOM killer was not triggered.
+
+The included `script.py` is configured for an even larger 50,000,000-command SET workload and sends commands in bounded client-side batches. Run it only with a cache policy/workload combination that can continuously nominate victims, while monitoring RSS and response progress. “OOM-immunity” here means capacity-driven resistance to unbounded cache growth under the tested workload, not immunity to every allocator failure or malicious protocol input.
+
+### Correctness and concurrency coverage
+
+The automated suite covers:
+
+- Zero-copy bulk-string extraction with backing-pointer identity verification.
+- Incomplete-frame rollback and malformed CRLF rejection.
+- Nested RESP arrays.
+- Cache-line alignment.
+- Sixteen native writer threads inserting 160,000 unique records.
+- Sampled-LFU victim selection and capacity trimming.
+- Strict-LRU chronological eviction and stale-event handling.
+- Pipelined SET/GET over a real loopback TCP connection.
+- Read-buffer overflow and batched maintenance draining.
+
+Run the optimized suite when evaluating concurrency behavior:
+
+```bash
+cargo test --release --all-features
+```
+
+## 🚀 Quick Start / Usage
 
 ### Prerequisites
 
-- Rust 1.85 or newer, required for Rust Edition 2024.
-- Cargo, installed with Rust through [rustup](https://rustup.rs/).
-- Git for source control.
+- Rust 1.85 or newer for Edition 2024.
+- Cargo, installed through [rustup](https://rustup.rs/).
+- Optional: `redis-cli` or Python 3 with `redis-py`.
 
-Confirm the toolchain:
+### Build and run
 
-```console
-rustc --version
-cargo --version
-```
-
-### Create the library from scratch
-
-To reproduce the initial project layout in a new directory:
-
-```console
-cargo new aether-cache --lib --vcs git
+```bash
+git clone <repository-url>
 cd aether-cache
-cargo add tokio --features full
-cargo add bytes
-cargo add parking_lot
-cargo add hashbrown
-cargo add crossbeam-queue
+cargo build --release
+cargo run --release
 ```
 
-Do not run `cargo new` inside an existing checkout.
+The server listens on `0.0.0.0:6379`, the conventional Redis port:
 
-### Build and validate
+```text
+aether-cache server started on port 6379
+```
 
-From the crate root:
+If startup reports an address-in-use error, stop the existing Redis/Aether process bound to port 6379 before retrying.
 
-```console
+### Use `redis-cli`
+
+```bash
+redis-cli -h 127.0.0.1 -p 6379 SET portfolio:project aether-cache
+redis-cli -h 127.0.0.1 -p 6379 GET portfolio:project
+```
+
+Expected output:
+
+```text
+OK
+"aether-cache"
+```
+
+An interactive session works as well:
+
+```bash
+redis-cli -h 127.0.0.1 -p 6379
+127.0.0.1:6379> SET key value
+OK
+127.0.0.1:6379> GET key
+"value"
+```
+
+Only RESP bulk-string arrays containing `SET key value` and `GET key` are currently supported. Other commands return `-ERR unknown command`.
+
+### Use `redis-py`
+
+Install the client:
+
+```bash
+python -m pip install redis
+```
+
+```python
+import redis
+
+client = redis.Redis(
+    host="127.0.0.1",
+    port=6379,
+    protocol=2,
+    decode_responses=False,
+)
+
+client.set(b"analytical:key", b"zero-copy-payload")
+value = client.get(b"analytical:key")
+print(value)  # b'zero-copy-payload'
+```
+
+RESP2 is selected explicitly because the server intentionally implements a focused RESP2 command subset rather than Redis handshake, RESP3 negotiation, or metadata commands.
+
+### Stress client
+
+With the release server running in another terminal:
+
+```bash
+python script.py
+```
+
+The script uses a single persistent socket, large OS socket buffers, pipelined SET frames, bounded Python-side batches, and complete response draining. Adjust `TOTAL_COMMANDS` and `BATCH_SIZE` for the available test machine before running.
+
+### Development validation
+
+```bash
 cargo fmt --check
 cargo check --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
-cargo test --release
 ```
 
-Use the debug profile for development and correctness checks. Use the release profile for concurrency stress tests and future benchmarks because lock contention, hashing throughput, and allocation behavior are not meaningfully represented by unoptimized builds.
-
-### Current source layout
+## 📁 Source Layout
 
 ```text
 src/
-├── entry.rs   # Zero-copy payload and TTL metadata representation
-├── lib.rs     # Public module exports
-└── shard.rs   # Cache-line-aligned shards and hash routing
+├── entry.rs      # CacheEntry layout, TTL checks, and atomic frequency metadata
+├── eviction.rs   # EvictionPolicy, lock-free ReadBuffer, StrictLru, SampledLfu
+├── frame.rs      # Strictly typed RESP frame model
+├── lib.rs        # Public library modules
+├── main.rs       # StrictLru server configuration and Tokio entrypoint
+├── parse.rs      # Transactional two-phase zero-copy RESP parser
+├── server.rs     # Async TCP accept loop and SET/GET execution
+└── shard.rs      # Cache-line-aligned generic sharding engine
 ```
+
+## ⚙️ Current Runtime Configuration
+
+| Parameter | Value |
+|---|---:|
+| TCP port | `6379` |
+| Shards | `64` |
+| Total configured entries | `1,000,000` |
+| Read events per shard batch | `128` |
+| Executable eviction policy | `StrictLru` |
+| Hash builder | `hashbrown::DefaultHashBuilder` |
+| Parser nesting limit | `128` |
+
+---
+
+Aether Cache is an exploration of practical systems design: explicit memory ownership, mechanically enforced lock lifetimes, cache-aware data layout, bounded approximation algorithms, and asynchronous protocol execution composed without a global synchronization bottleneck.
