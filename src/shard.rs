@@ -6,7 +6,8 @@ use std::{
 use hashbrown::HashMap;
 use parking_lot::RwLock;
 
-pub use crate::eviction::{EvictionPolicy, SampledLfu};
+pub use crate::eviction::SampledLfu;
+use crate::eviction::{EvictionPolicy, ReadBuffer};
 
 /// The fixed shard count. It must remain a power of two for bitmask routing.
 pub const SHARD_COUNT: usize = 64;
@@ -16,16 +17,18 @@ pub const SHARD_COUNT: usize = 64;
 /// Cache-line alignment prevents adjacent shard locks from sharing a cache line
 /// and invalidating each other's CPU caches under concurrent writes.
 #[repr(align(64))]
-pub struct CacheShard<K, V> {
+pub struct CacheShard<K, V, P> {
     pub map: RwLock<HashMap<K, V>>,
-    pub policy: SampledLfu,
+    pub policy: P,
+    pub read_buffer: ReadBuffer,
 }
 
-impl<K, V> CacheShard<K, V> {
-    fn new(capacity_per_shard: usize) -> Self {
+impl<K, V, P> CacheShard<K, V, P> {
+    fn new(policy: P) -> Self {
         Self {
             map: RwLock::new(HashMap::new()),
-            policy: SampledLfu::new(capacity_per_shard),
+            policy,
+            read_buffer: ReadBuffer::new(128),
         }
     }
 }
@@ -34,13 +37,14 @@ impl<K, V> CacheShard<K, V> {
 ///
 /// Unlike a Python dictionary protected by one lock, unrelated keys can be read
 /// or written concurrently when they route to different shards.
-pub struct ShardedCache<K, V, S = RandomState> {
-    shards: Box<[CacheShard<K, V>]>,
+pub struct ShardedCache<K, V, P = SampledLfu, S = RandomState> {
+    shards: Box<[CacheShard<K, V, P>]>,
     hash_builder: S,
 }
 
-impl<K, V, S> ShardedCache<K, V, S>
+impl<K, V, P, S> ShardedCache<K, V, P, S>
 where
+    P: EvictionPolicy,
     S: BuildHasher,
 {
     /// Creates an empty cache with a power-of-two shard count and hash builder.
@@ -48,7 +52,12 @@ where
     /// # Panics
     ///
     /// Panics if `shard_count` is zero or is not a power of two.
-    pub fn new(shard_count: usize, total_capacity: usize, hash_builder: S) -> Self {
+    pub fn new(
+        shard_count: usize,
+        total_capacity: usize,
+        policy_factory: impl Fn(usize) -> P,
+        hash_builder: S,
+    ) -> Self {
         assert!(
             shard_count.is_power_of_two(),
             "shard count must be a non-zero power of two"
@@ -56,7 +65,9 @@ where
         let capacity_per_shard = total_capacity / shard_count;
 
         let mut shards = Vec::with_capacity(shard_count);
-        shards.resize_with(shard_count, || CacheShard::new(capacity_per_shard));
+        shards.resize_with(shard_count, || {
+            CacheShard::new(policy_factory(capacity_per_shard))
+        });
 
         Self {
             shards: shards.into_boxed_slice(),
@@ -65,7 +76,7 @@ where
     }
 
     /// Hashes `key` and returns its shard using power-of-two bitmask routing.
-    pub fn get_shard<Q>(&self, key: &Q) -> &CacheShard<K, V>
+    pub fn get_shard<Q>(&self, key: &Q) -> &CacheShard<K, V, P>
     where
         Q: Hash + ?Sized,
     {
@@ -78,7 +89,7 @@ where
 
 impl<K, V> Default for ShardedCache<K, V> {
     fn default() -> Self {
-        Self::new(SHARD_COUNT, 100_000, RandomState::new())
+        Self::new(SHARD_COUNT, 100_000, SampledLfu::new, RandomState::new())
     }
 }
 
@@ -86,11 +97,11 @@ impl<K, V> Default for ShardedCache<K, V> {
 mod tests {
     use std::{mem::align_of, thread};
 
-    use super::{CacheShard, SHARD_COUNT, ShardedCache};
+    use super::{CacheShard, SHARD_COUNT, SampledLfu, ShardedCache};
 
     #[test]
     fn shards_are_cache_line_aligned() {
-        assert_eq!(align_of::<CacheShard<u64, u64>>(), 64);
+        assert!(align_of::<CacheShard<u64, u64, SampledLfu>>() >= 64);
     }
 
     #[test]

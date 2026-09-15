@@ -14,17 +14,18 @@ use crate::{
 const INITIAL_READ_CAPACITY: usize = 8 * 1024;
 
 /// An asynchronous TCP front end for a shared sharded cache.
-pub struct CacheServer<S> {
-    cache: Arc<ShardedCache<Bytes, CacheEntry, S>>,
+pub struct CacheServer<P, S> {
+    cache: Arc<ShardedCache<Bytes, CacheEntry, P, S>>,
     port: u16,
 }
 
-impl<S> CacheServer<S>
+impl<P, S> CacheServer<P, S>
 where
+    P: EvictionPolicy + Send + Sync + 'static,
     S: BuildHasher + Send + Sync + 'static,
 {
     /// Creates a server that owns a shared cache handle and listens on `port`.
-    pub fn new(cache: Arc<ShardedCache<Bytes, CacheEntry, S>>, port: u16) -> Self {
+    pub fn new(cache: Arc<ShardedCache<Bytes, CacheEntry, P, S>>, port: u16) -> Self {
         Self { cache, port }
     }
 
@@ -47,11 +48,12 @@ where
     }
 }
 
-async fn read_connection<S>(
+async fn read_connection<P, S>(
     mut stream: TcpStream,
-    cache: Arc<ShardedCache<Bytes, CacheEntry, S>>,
+    cache: Arc<ShardedCache<Bytes, CacheEntry, P, S>>,
 ) -> io::Result<()>
 where
+    P: EvictionPolicy,
     S: BuildHasher,
 {
     let mut buffer = BytesMut::with_capacity(INITIAL_READ_CAPACITY);
@@ -73,12 +75,13 @@ where
     }
 }
 
-async fn execute_frame<S>(
+async fn execute_frame<P, S>(
     stream: &mut TcpStream,
-    cache: &ShardedCache<Bytes, CacheEntry, S>,
+    cache: &ShardedCache<Bytes, CacheEntry, P, S>,
     frame: Frame,
 ) -> io::Result<()>
 where
+    P: EvictionPolicy,
     S: BuildHasher,
 {
     let Frame::Array(elements) = frame else {
@@ -110,8 +113,8 @@ where
             return write_unknown_command(stream).await;
         };
 
+        let shard = cache.get_shard(&key);
         let payload = {
-            let shard = cache.get_shard(&key);
             let map = shard.map.read();
             map.get(&key).and_then(|entry| {
                 if entry.is_expired() {
@@ -122,6 +125,15 @@ where
                 }
             })
         };
+
+        if let Err(rejected_key) = shard.read_buffer.push_key(key) {
+            let mut map = shard.map.write();
+            shard.policy.promote(rejected_key);
+            while let Some(queued_key) = shard.read_buffer.queue.pop() {
+                shard.policy.promote(queued_key);
+            }
+            shard.policy.evict(&mut map);
+        }
 
         if let Some(payload) = payload {
             let header = format!("${}\r\n", payload.len());
@@ -156,16 +168,19 @@ mod tests {
     };
 
     use super::read_connection;
-    use crate::{entry::CacheEntry, shard::ShardedCache};
+    use crate::{entry::CacheEntry, eviction::StrictLru, shard::ShardedCache};
 
     #[tokio::test]
     async fn executes_pipelined_set_and_get() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
-        let cache = Arc::new(ShardedCache::<Bytes, CacheEntry, DefaultHashBuilder>::new(
-            64,
-            1_000,
-            DefaultHashBuilder::default(),
+        let cache = Arc::new(ShardedCache::<
+            Bytes,
+            CacheEntry,
+            StrictLru,
+            DefaultHashBuilder,
+        >::new(
+            64, 1_000, StrictLru::new, DefaultHashBuilder::default()
         ));
         let server_cache = Arc::clone(&cache);
         let server = tokio::spawn(async move {
@@ -187,5 +202,50 @@ mod tests {
 
         client.shutdown().await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drains_read_buffer_when_get_overflows_it() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cache = Arc::new(ShardedCache::<
+            Bytes,
+            CacheEntry,
+            StrictLru,
+            DefaultHashBuilder,
+        >::new(
+            64, 1_000, StrictLru::new, DefaultHashBuilder::default()
+        ));
+        let key = Bytes::from_static(b"key");
+        let shard = cache.get_shard(&key);
+        shard.map.write().insert(
+            key.clone(),
+            CacheEntry::new(key.clone(), Bytes::from_static(b"value"), None),
+        );
+        for index in 0..128 {
+            shard
+                .read_buffer
+                .push_key(Bytes::from(index.to_string()))
+                .unwrap();
+        }
+
+        let server_cache = Arc::clone(&cache);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            read_connection(stream, server_cache).await.unwrap();
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n")
+            .await
+            .unwrap();
+
+        let mut response = [0; 11];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"$5\r\nvalue\r\n");
+
+        client.shutdown().await.unwrap();
+        server.await.unwrap();
+        assert!(cache.get_shard(&key).read_buffer.queue.pop().is_none());
     }
 }

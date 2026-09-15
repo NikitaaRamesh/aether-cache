@@ -1,5 +1,8 @@
+use std::collections::VecDeque;
+
 use bytes::Bytes;
 use crossbeam_queue::ArrayQueue;
+use parking_lot::Mutex;
 
 /// A bounded, lock-free buffer of cache keys observed by concurrent readers.
 ///
@@ -9,7 +12,7 @@ use crossbeam_queue::ArrayQueue;
 /// contention across many reads. When the buffer is full, [`Self::push_key`]
 /// returns ownership of the unqueued key so the caller can trigger that drain.
 pub struct ReadBuffer {
-    queue: ArrayQueue<Bytes>,
+    pub(crate) queue: ArrayQueue<Bytes>,
 }
 
 impl ReadBuffer {
@@ -40,6 +43,9 @@ pub trait EvictionPolicy {
     /// Records that `key` was accessed.
     fn on_read(&self, key: Bytes);
 
+    /// Promotes `key` in policies that maintain an explicit access order.
+    fn promote(&self, key: Bytes);
+
     /// Removes entries while holding the target shard's write guard.
     fn evict(
         &self,
@@ -67,6 +73,10 @@ impl EvictionPolicy for SampledLfu {
         // LFU frequency is already tracked by CacheEntry's atomic counter.
     }
 
+    fn promote(&self, _key: Bytes) {
+        // LFU does not maintain chronological access order.
+    }
+
     fn evict(
         &self,
         map: &mut parking_lot::RwLockWriteGuard<
@@ -91,6 +101,62 @@ impl EvictionPolicy for SampledLfu {
                 break;
             };
             map.remove(&victim);
+        }
+    }
+}
+
+/// A strict least-recently-used policy with explicit promotion ordering.
+///
+/// Promotions are intended to be applied in batches drained from [`ReadBuffer`].
+/// The internal `parking_lot` lock provides the interior mutability required by
+/// [`EvictionPolicy::evict`], whose shared-reference API supports concurrent
+/// policy implementations without using a standard-library mutex.
+pub struct StrictLru {
+    target_capacity: usize,
+    access_order: Mutex<VecDeque<Bytes>>,
+}
+
+impl StrictLru {
+    /// Creates an empty LRU policy that trims maps to `target_capacity` entries.
+    pub fn new(target_capacity: usize) -> Self {
+        Self {
+            target_capacity,
+            access_order: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Appends `key` as the most recently accessed entry.
+    pub fn promote(&self, key: Bytes) {
+        self.access_order.lock().push_back(key);
+    }
+}
+
+impl EvictionPolicy for StrictLru {
+    fn on_read(&self, _key: Bytes) {
+        // ReadBuffer batches promotions so cache reads do not contend here.
+    }
+
+    fn promote(&self, key: Bytes) {
+        StrictLru::promote(self, key);
+    }
+
+    fn evict(
+        &self,
+        map: &mut parking_lot::RwLockWriteGuard<
+            '_,
+            hashbrown::HashMap<Bytes, crate::entry::CacheEntry>,
+        >,
+    ) {
+        let mut access_order = self.access_order.lock();
+
+        while map.len() > self.target_capacity {
+            let Some(victim) = access_order.pop_front() else {
+                break;
+            };
+
+            if map.contains_key(&victim) {
+                map.remove(&victim);
+            }
         }
     }
 }
@@ -170,5 +236,64 @@ mod sampled_lfu_tests {
         SampledLfu::new(3).evict(&mut map);
 
         assert_eq!(map.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod strict_lru_tests {
+    use bytes::Bytes;
+    use hashbrown::HashMap;
+    use parking_lot::RwLock;
+
+    use super::{EvictionPolicy, StrictLru};
+    use crate::entry::CacheEntry;
+
+    fn insert(map: &mut HashMap<Bytes, CacheEntry>, key: Bytes) {
+        map.insert(key.clone(), CacheEntry::new(key, Bytes::new(), None));
+    }
+
+    #[test]
+    fn evicts_promoted_keys_in_chronological_order() {
+        let lock = RwLock::new(HashMap::new());
+        let policy = StrictLru::new(1);
+        let oldest = Bytes::from_static(b"oldest");
+        let middle = Bytes::from_static(b"middle");
+        let newest = Bytes::from_static(b"newest");
+
+        policy.promote(oldest.clone());
+        policy.promote(middle.clone());
+        policy.promote(newest.clone());
+
+        let mut map = lock.write();
+        insert(&mut map, oldest.clone());
+        insert(&mut map, middle.clone());
+        insert(&mut map, newest.clone());
+        policy.evict(&mut map);
+
+        assert_eq!(map.len(), 1);
+        assert!(!map.contains_key(&oldest));
+        assert!(!map.contains_key(&middle));
+        assert!(map.contains_key(&newest));
+    }
+
+    #[test]
+    fn skips_stale_access_order_entries() {
+        let lock = RwLock::new(HashMap::new());
+        let policy = StrictLru::new(1);
+        let stale = Bytes::from_static(b"stale");
+        let victim = Bytes::from_static(b"victim");
+        let survivor = Bytes::from_static(b"survivor");
+
+        policy.promote(stale);
+        policy.promote(victim.clone());
+
+        let mut map = lock.write();
+        insert(&mut map, victim.clone());
+        insert(&mut map, survivor.clone());
+        policy.evict(&mut map);
+
+        assert_eq!(map.len(), 1);
+        assert!(!map.contains_key(&victim));
+        assert!(map.contains_key(&survivor));
     }
 }

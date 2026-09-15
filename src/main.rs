@@ -2,6 +2,7 @@ use std::{io, sync::Arc};
 
 use aether_cache::{
     entry::CacheEntry,
+    eviction::StrictLru,
     server::CacheServer,
     shard::{SHARD_COUNT, ShardedCache},
 };
@@ -13,9 +14,15 @@ const TOTAL_CAPACITY: usize = 1_000_000;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let cache = Arc::new(ShardedCache::<Bytes, CacheEntry, DefaultHashBuilder>::new(
+    let cache = Arc::new(ShardedCache::<
+        Bytes,
+        CacheEntry,
+        StrictLru,
+        DefaultHashBuilder,
+    >::new(
         SHARD_COUNT,
         TOTAL_CAPACITY,
+        StrictLru::new,
         DefaultHashBuilder::default(),
     ));
     let server = CacheServer::new(cache, SERVER_PORT);
