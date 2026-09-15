@@ -50,6 +50,11 @@ impl CacheEntry {
             });
     }
 
+    /// Returns the current access frequency used by eviction policies.
+    pub fn access_count(&self) -> u32 {
+        self.access_counter.load(Ordering::Relaxed)
+    }
+
     /// Returns whether this entry has reached its absolute expiration time.
     pub fn is_expired(&self) -> bool {
         match (self.expires_at, current_time_ms()) {
