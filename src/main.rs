@@ -12,13 +12,11 @@ const SERVER_PORT: u16 = 6379;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let cache = Arc::new(
-        ShardedCache::<Bytes, CacheEntry, DefaultHashBuilder>::with_hasher(
-            SHARD_COUNT,
-            DefaultHashBuilder::default(),
-        ),
-    );
-    let server = CacheServer::new(Arc::clone(&cache), SERVER_PORT);
+    let cache = Arc::new(ShardedCache::<Bytes, CacheEntry, DefaultHashBuilder>::new(
+        SHARD_COUNT,
+        DefaultHashBuilder::default(),
+    ));
+    let server = CacheServer::new(cache, SERVER_PORT);
 
     println!("aether-cache server started on port {SERVER_PORT}");
 

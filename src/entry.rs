@@ -1,5 +1,5 @@
 use std::{
-    sync::atomic::AtomicU32,
+    sync::atomic::{AtomicU32, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -25,12 +25,8 @@ impl CacheEntry {
     /// If the system clock is unavailable before the Unix epoch, a supplied TTL
     /// is treated as non-expiring rather than risking immediate data eviction.
     pub fn new(key: Bytes, value: Bytes, ttl_ms: Option<u64>) -> Self {
-        let expires_at = ttl_ms.and_then(|ttl| {
-            let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
-            let now_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-
-            Some(now_ms.saturating_add(ttl))
-        });
+        let expires_at =
+            ttl_ms.and_then(|ttl| current_time_ms().map(|now| now.saturating_add(ttl)));
 
         Self {
             key,
@@ -39,4 +35,31 @@ impl CacheEntry {
             access_counter: AtomicU32::new(0),
         }
     }
+
+    /// Returns the immutable value payload without cloning its backing bytes.
+    pub fn value(&self) -> &Bytes {
+        &self.value
+    }
+
+    /// Records an access without taking the containing shard's write lock.
+    pub fn record_access(&self) {
+        let _ = self
+            .access_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            });
+    }
+
+    /// Returns whether this entry has reached its absolute expiration time.
+    pub fn is_expired(&self) -> bool {
+        match (self.expires_at, current_time_ms()) {
+            (Some(expires_at), Some(now)) => now >= expires_at,
+            _ => false,
+        }
+    }
+}
+
+fn current_time_ms() -> Option<u64> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    Some(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
 }

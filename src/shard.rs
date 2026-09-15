@@ -35,13 +35,6 @@ pub struct ShardedCache<K, V, S = RandomState> {
     hash_builder: S,
 }
 
-impl<K, V> ShardedCache<K, V, RandomState> {
-    /// Creates an empty cache containing [`SHARD_COUNT`] shards.
-    pub fn new() -> Self {
-        Self::with_hasher(SHARD_COUNT, RandomState::new())
-    }
-}
-
 impl<K, V, S> ShardedCache<K, V, S>
 where
     S: BuildHasher,
@@ -51,7 +44,7 @@ where
     /// # Panics
     ///
     /// Panics if `shard_count` is zero or is not a power of two.
-    pub fn with_hasher(shard_count: usize, hash_builder: S) -> Self {
+    pub fn new(shard_count: usize, hash_builder: S) -> Self {
         assert!(
             shard_count.is_power_of_two(),
             "shard count must be a non-zero power of two"
@@ -80,7 +73,7 @@ where
 
 impl<K, V> Default for ShardedCache<K, V> {
     fn default() -> Self {
-        Self::new()
+        Self::new(SHARD_COUNT, RandomState::new())
     }
 }
 
@@ -97,14 +90,14 @@ mod tests {
 
     #[test]
     fn creates_the_fixed_number_of_shards() {
-        let cache = ShardedCache::<u64, u64>::new();
+        let cache = ShardedCache::<u64, u64>::default();
 
         assert_eq!(cache.shards.len(), SHARD_COUNT);
     }
 
     #[test]
     fn equal_keys_route_to_the_same_shard() {
-        let cache = ShardedCache::<String, u64>::new();
+        let cache = ShardedCache::<String, u64>::default();
 
         assert!(std::ptr::eq(
             cache.get_shard("consistent-key"),
@@ -117,7 +110,7 @@ mod tests {
         const THREAD_COUNT: usize = 16;
         const INSERTS_PER_THREAD: usize = 10_000;
 
-        let cache = ShardedCache::<String, String>::new();
+        let cache = ShardedCache::<String, String>::default();
 
         thread::scope(|scope| {
             let mut handles = Vec::with_capacity(THREAD_COUNT);
